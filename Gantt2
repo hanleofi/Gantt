@@ -1,0 +1,241 @@
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+
+def print_schedule(schedule_df):
+    """In lịch trình điều độ chi tiết."""
+    print("\nLịch trình điều độ chi tiết:")
+    print("-" * 80)
+    print(f"{'Job ID':<20} {'Machine':<10} {'Start Time':<20} {'End Time':<20} {'Duration (phút)':<15} {'Operation':<10}")
+    print("-" * 80)
+    for _, row in schedule_df.iterrows():
+        start_time = row["Start Time"]
+        end_time = row["End Time"]
+        duration = row["Duration"]
+        start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S') if isinstance(start_time, pd.Timestamp) else str(start_time)
+        end_time_str = end_time.strftime('%Y-%m-%d %H:%M:%S') if isinstance(end_time, pd.Timestamp) else str(end_time)
+        print(f"{row['Job ID']:<20} {row['Machine']:<10} {start_time_str:<20} {end_time_str:<20} {duration:<15.2f} {row['Operation']:<10}")
+    print("-" * 80)
+
+# Đọc dữ liệu từ file Excel
+try:
+    df = pd.read_excel("Book1.xlsx", sheet_name="Sheet1")
+except FileNotFoundError:
+    print("File 'Book1.xlsx' not found. Please ensure the file exists in the same directory.")
+    exit()
+except ValueError:
+    print("Sheet 'Sheet1' not found in the Excel file.")
+    exit()
+
+# Kiểm tra dữ liệu
+required_columns = ["Job ID", "Component", "SS start time", "SS end time", "Cut time", "Grind time"]
+if not all(col in df.columns for col in required_columns):
+    print("Missing required columns in the Excel file.")
+    exit()
+
+# Chuyển SS start time và SS end time thành datetime
+df['SS start time'] = pd.to_datetime(df['SS start time'], format='%m/%d/%y', errors='coerce')
+df['SS end time'] = pd.to_datetime(df['SS end time'], format='%m/%d/%y', errors='coerce')
+df.dropna(subset=['SS start time', 'SS end time'], inplace=True)
+
+# Khởi tạo lịch trình
+schedule = []
+CHANGEOVER_TIME = 30  # 30 phút changeover
+
+# Khởi tạo thời gian máy dựa trên SS end time sớm nhất
+if not df.empty and isinstance(df['SS end time'].min(), pd.Timestamp):
+    start_of_scheduling = df['SS end time'].min()
+    upz_time = start_of_scheduling
+    tw_time = start_of_scheduling
+    cw_time = start_of_scheduling
+else:
+    print("No valid 'SS end time' found to start scheduling.")
+    exit()
+
+# Điều độ công việc theo FCFS
+for index, row in df.iterrows():
+    job_id = row["Job ID"]
+    component = row["Component"]
+    ss_start_time = row["SS start time"]
+    ss_end_time = row["SS end time"]
+    cut_time = row["Cut time"] if pd.notna(row["Cut time"]) else 0  # Phút
+    grind_time = row["Grind time"]  # Phút
+
+    # Thêm công đoạn SS (làm sạch)
+    ss_duration = (ss_end_time - ss_start_time).total_seconds() / 60  # Chuyển sang phút
+    if ss_duration > 0:
+        schedule.append({
+            "Job ID": f"{job_id}_SS",
+            "Machine": "SS",
+            "Start Time": ss_start_time,
+            "End Time": ss_end_time,
+            "Duration": ss_duration,
+            "Operation": "Sanitation"
+        })
+    else:
+        print(f"Warning: SS duration for Job {job_id} is non-positive ({ss_duration:.2f} minutes). Skipping SS.")
+
+    if component == "Shell":
+        # Shell: Cắt trên UPZ, nghiền trên CW
+        upz_time = max(upz_time, ss_end_time)
+        schedule.append({
+            "Job ID": f"{job_id}_Cut",
+            "Machine": "UPZ",
+            "Start Time": upz_time,
+            "End Time": upz_time + timedelta(minutes=cut_time),
+            "Duration": cut_time,
+            "Operation": "Cut"
+        })
+        upz_time = upz_time + timedelta(minutes=cut_time)
+        # Thêm changeover sau Cut
+        schedule.append({
+            "Job ID": f"Changeover_UPZ_{job_id}",
+            "Machine": "UPZ",
+            "Start Time": upz_time,
+            "End Time": upz_time + timedelta(minutes=CHANGEOVER_TIME),
+            "Duration": CHANGEOVER_TIME,
+            "Operation": "Changeover"
+        })
+        upz_time = upz_time + timedelta(minutes=CHANGEOVER_TIME)
+
+        # Phân bổ nghiền cho CW
+        grind_start_time = max(cw_time, upz_time)
+        schedule.append({
+            "Job ID": f"{job_id}_Grind",
+            "Machine": "CW",
+            "Start Time": grind_start_time,
+            "End Time": grind_start_time + timedelta(minutes=grind_time),
+            "Duration": grind_time,
+            "Operation": "Grind"
+        })
+        cw_time = grind_start_time + timedelta(minutes=grind_time)
+        # Thêm changeover sau Grind
+        schedule.append({
+            "Job ID": f"Changeover_CW_{job_id}",
+            "Machine": "CW",
+            "Start Time": cw_time,
+            "End Time": cw_time + timedelta(minutes=CHANGEOVER_TIME),
+            "Duration": CHANGEOVER_TIME,
+            "Operation": "Changeover"
+        })
+        cw_time = cw_time + timedelta(minutes=CHANGEOVER_TIME)
+    else:
+        # Fruit/Other: Nghiền trên TW (nếu Fruit) hoặc CW
+        if component == "Other":
+            # Other chỉ chạy trên CW
+            grind_start_time = max(cw_time, ss_end_time)
+            schedule.append({
+                "Job ID": job_id,
+                "Machine": "CW",
+                "Start Time": grind_start_time,
+                "End Time": grind_start_time + timedelta(minutes=grind_time),
+                "Duration": grind_time,
+                "Operation": "Grind"
+            })
+            cw_time = grind_start_time + timedelta(minutes=grind_time)
+            # Thêm changeover sau Grind
+            schedule.append({
+                "Job ID": f"Changeover_CW_{job_id}",
+                "Machine": "CW",
+                "Start Time": cw_time,
+                "End Time": cw_time + timedelta(minutes=CHANGEOVER_TIME),
+                "Duration": CHANGEOVER_TIME,
+                "Operation": "Changeover"
+            })
+            cw_time = cw_time + timedelta(minutes=CHANGEOVER_TIME)
+        else:
+            # Fruit: Luôn chạy trên TW
+            grind_start_time = max(tw_time, ss_end_time)
+            schedule.append({
+                "Job ID": job_id,
+                "Machine": "TW",
+                "Start Time": grind_start_time,
+                "End Time": grind_start_time + timedelta(minutes=grind_time),
+                "Duration": grind_time,
+                "Operation": "Grind"
+            })
+            tw_time = grind_start_time + timedelta(minutes=grind_time)
+            # Thêm changeover sau Grind
+            schedule.append({
+                "Job ID": f"Changeover_TW_{job_id}",
+                "Machine": "TW",
+                "Start Time": tw_time,
+                "End Time": tw_time + timedelta(minutes=CHANGEOVER_TIME),
+                "Duration": CHANGEOVER_TIME,
+                "Operation": "Changeover"
+            })
+            tw_time = tw_time + timedelta(minutes=CHANGEOVER_TIME)
+
+# Chuyển lịch trình thành DataFrame và lưu ra CSV
+schedule_df = pd.DataFrame(schedule)
+schedule_df['Start Time'] = schedule_df['Start Time'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if isinstance(x, pd.Timestamp) else x)
+schedule_df['End Time'] = schedule_df['End Time'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if isinstance(x, pd.Timestamp) else x)
+schedule_df.to_csv("schedule.csv", index=False)
+schedule_df.to_excel("schedule.xlsx", index=False)
+print("Schedule saved to 'schedule.csv' and 'schedule.xlsx'.")
+
+# In lịch trình chi tiết
+print_schedule(schedule_df)
+
+# Vẽ sơ đồ Gantt
+fig, ax = plt.subplots(figsize=(12, 6))
+machines = ["SS", "UPZ", "TW", "CW"]
+y_positions = [3, 2, 1, 0]
+colors = {"Sanitation": "gold", "Cut": "skyblue", "Grind": "lightgreen", "Changeover": "gray"}
+
+for entry in schedule:
+    start_time = entry["Start Time"]
+    duration = entry["Duration"]
+    machine = entry["Machine"]
+    operation = entry["Operation"]
+    job_id = entry["Job ID"]
+
+    # Chuyển thời gian thành phút tương đối cho Gantt
+    start_plot_time = (start_time - start_of_scheduling).total_seconds() / 60 if isinstance(start_time, pd.Timestamp) else start_time
+
+    # Vẽ hình chữ nhật
+    ax.barh(y_positions[machines.index(machine)], duration, left=start_plot_time, height=0.3, color=colors[operation], alpha=0.8)
+
+    # Thêm nhãn, bỏ nhãn cho Changeover
+    if operation != "Changeover":
+        ax.text(start_plot_time + duration / 2, y_positions[machines.index(machine)], job_id, ha="center", va="center", fontsize=8, color="black")
+
+# Định dạng trục
+ax.set_yticks(y_positions)
+ax.set_yticklabels(machines)
+ax.set_xlabel("Thời gian")
+ax.set_title("Sơ đồ Gantt điều độ Flowshop")
+ax.grid(True, linestyle="--", alpha=0.5)
+
+# Điều chỉnh giới hạn trục x
+min_plot_time = min([(entry["Start Time"] - start_of_scheduling).total_seconds() / 60 for entry in schedule])
+max_plot_time = max([(entry["End Time"] - start_of_scheduling).total_seconds() / 60 for entry in schedule])
+ax.set_xlim(min_plot_time - 10, max_plot_time + 10)
+
+# Định dạng trục x để hiển thị thời gian thực
+def format_time(x, pos=None):
+    time_in_minutes = x
+    if isinstance(start_of_scheduling, pd.Timestamp):
+        absolute_time = start_of_scheduling + timedelta(minutes=time_in_minutes)
+        return absolute_time.strftime('%Y-%m-%d %H:%M')
+    else:
+        return f"{int(time_in_minutes)}"
+
+ax.xaxis.set_major_formatter(plt.FuncFormatter(format_time))
+plt.xticks(rotation=45, ha='right')
+
+# Hiển thị biểu đồ
+plt.tight_layout()
+plt.savefig("gantt_chart.png")
+plt.show()
+
+# Tính và in thời gian chờ
+tw_idle = sum([(entry["Start Time"] - tw_time).total_seconds() / 60 for entry in schedule if entry["Machine"] == "TW" and entry["Start Time"] > tw_time])
+cw_idle = sum([(entry["Start Time"] - cw_time).total_seconds() / 60 for entry in schedule if entry["Machine"] == "CW" and entry["Start Time"] > cw_time])
+makespan = (start_of_scheduling + timedelta(minutes=max_plot_time)).strftime('%Y-%m-%d %H:%M:%S')
+
+print(f"Thời gian chờ TW: {tw_idle:.2f} phút")
+print(f"Thời gian chờ CW: {cw_idle:.2f} phút")
+print(f"Makespan: {makespan}")
